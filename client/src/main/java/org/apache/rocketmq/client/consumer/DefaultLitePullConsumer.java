@@ -37,6 +37,9 @@ import org.apache.rocketmq.common.protocol.heartbeat.MessageModel;
 import org.apache.rocketmq.logging.InternalLogger;
 import org.apache.rocketmq.remoting.RPCHook;
 
+/**
+ * RocketMq有两种类型的消费者，一种是DefaultLitePullConsumer,主动拉的模式，另一种是DefaultMQPushConsumer被动接收的模式。
+ */
 public class DefaultLitePullConsumer extends ClientConfig implements LitePullConsumer {
 
     private final InternalLogger log = ClientLogger.getLog();

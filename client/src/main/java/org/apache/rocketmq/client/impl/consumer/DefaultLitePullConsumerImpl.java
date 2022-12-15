@@ -233,6 +233,7 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
     class MessageQueueListenerImpl implements MessageQueueListener {
         @Override
         public void messageQueueChanged(String topic, Set<MessageQueue> mqAll, Set<MessageQueue> mqDivided) {
+            // 取出所有的MessageQueueListener
             MessageModel messageModel = defaultLitePullConsumer.getMessageModel();
             switch (messageModel) {
                 case BROADCASTING:
@@ -434,8 +435,10 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
     private void startPullTask(Collection<MessageQueue> mqSet) {
         for (MessageQueue messageQueue : mqSet) {
             if (!this.taskTable.containsKey(messageQueue)) {
+                // 创建消息拉取任务
                 PullTaskImpl pullTask = new PullTaskImpl(messageQueue);
                 this.taskTable.put(messageQueue, pullTask);
+                // 这个就是任务执行的入口
                 this.scheduledThreadPoolExecutor.schedule(pullTask, 0, TimeUnit.MILLISECONDS);
             }
         }
@@ -472,6 +475,7 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
             setSubscriptionType(SubscriptionType.SUBSCRIBE);
             SubscriptionData subscriptionData = FilterAPI.buildSubscriptionData(topic, subExpression);
             this.rebalanceImpl.getSubscriptionInner().put(topic, subscriptionData);
+            // 每个subscribe()都会设置MessageQueueListener
             this.defaultLitePullConsumer.setMessageQueueListener(new MessageQueueListenerImpl());
             assignedMessageQueue.setRebalanceImpl(this.rebalanceImpl);
             if (serviceState == ServiceState.RUNNING) {
@@ -532,6 +536,12 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
         }
     }
 
+    /**
+     * 跟DefaultMQPushConsumer不同的是，DefaultLitePullConsumerImpl.poll()默认的是消息消费一定成功，
+     * 如果消费失败的话，需要开发人员自己处理，消费失败的消息不会再次发送给消费者；
+     * @param timeout
+     * @return
+     */
     public synchronized List<MessageExt> poll(long timeout) {
         try {
             checkServiceState();
@@ -543,7 +553,7 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
                 maybeAutoCommit();
             }
             long endTime = System.currentTimeMillis() + timeout;
-
+            // 从阻塞队列中取ConsumeRequest
             ConsumeRequest consumeRequest = consumeRequestCache.poll(endTime - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
 
             if (endTime - System.currentTimeMillis() > 0) {
@@ -558,6 +568,7 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
             if (consumeRequest != null && !consumeRequest.getProcessQueue().isDropped()) {
                 List<MessageExt> messages = consumeRequest.getMessageExts();
                 long offset = consumeRequest.getProcessQueue().removeMessage(messages);
+                // 取到消息后直接更新消费点位
                 assignedMessageQueue.updateConsumeOffset(consumeRequest.getMessageQueue(), offset);
                 //If namespace not null , reset Topic without namespace.
                 this.resetTopic(messages);
@@ -726,6 +737,12 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
         return this.mQClientFactory.getMQAdminImpl().searchOffset(mq, timestamp);
     }
 
+    /**
+     * PullTaskImpl就是一个Runnable，那么最重要的就是它的run()方法，
+     * 这个方法就是负责从Broker拉消息并放进consumeRequestCache阻塞队列中，
+     * 这样poll()方法才能从consumeRequestCache阻塞队列中取到消息；
+     *
+     */
     public class PullTaskImpl implements Runnable {
         private final MessageQueue messageQueue;
         private volatile boolean cancelled = false;
@@ -752,12 +769,14 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
 
                 this.currentThread = Thread.currentThread();
 
+                // 如果messageQueue处于暂停状态，那么延迟1秒重新执行这个任务
                 if (assignedMessageQueue.isPaused(messageQueue)) {
                     scheduledThreadPoolExecutor.schedule(this, PULL_TIME_DELAY_MILLS_WHEN_PAUSE, TimeUnit.MILLISECONDS);
                     log.debug("Message Queue: {} has been paused!", messageQueue);
                     return;
                 }
 
+                //如果processQueue不存在或者已经被移除了，那么这个任务也不用执行了；
                 ProcessQueue processQueue = assignedMessageQueue.getProcessQueue(messageQueue);
 
                 if (null == processQueue || processQueue.isDropped()) {
@@ -765,6 +784,7 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
                     return;
                 }
 
+                // 流量控制
                 if ((long) consumeRequestCache.size() * defaultLitePullConsumer.getPullBatchSize() > defaultLitePullConsumer.getPullThresholdForAll()) {
                     scheduledThreadPoolExecutor.schedule(this, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL, TimeUnit.MILLISECONDS);
                     if ((consumeRequestFlowControlTimes++ % 1000) == 0) {
@@ -773,9 +793,11 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
                     return;
                 }
 
+                // 如果consumeRequestCache中的消息数量超过了PullThresholdForAll阈值，那么触发限流机制，
+                // 当前任务将不会继续拉消息，并且50毫秒后才会重新执行该任务；
                 long cachedMessageCount = processQueue.getMsgCount().get();
                 long cachedMessageSizeInMiB = processQueue.getMsgSize().get() / (1024 * 1024);
-
+                // 单个processQueue上面消息数量限制
                 if (cachedMessageCount > defaultLitePullConsumer.getPullThresholdForQueue()) {
                     scheduledThreadPoolExecutor.schedule(this, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL, TimeUnit.MILLISECONDS);
                     if ((queueFlowControlTimes++ % 1000) == 0) {
@@ -785,7 +807,11 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
                     }
                     return;
                 }
-
+                // 单个processQueue中消息总大小限制
+               /** 如果当前processQueue中消息的数量大于PullThresholdForQueue阈值，也同样触发限流机制，当前任务不再执行，50毫秒后重新执行该任务；
+                 * 如果当前processQueue中消息的总大小超过PullThresholdSizeForQueue（单位：MB）阈值，将触发限流机制，
+                 * 当前任务不再执行，50毫秒后重新执行该任务；
+                 */
                 if (cachedMessageSizeInMiB > defaultLitePullConsumer.getPullThresholdSizeForQueue()) {
                     scheduledThreadPoolExecutor.schedule(this, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL, TimeUnit.MILLISECONDS);
                     if ((queueFlowControlTimes++ % 1000) == 0) {
@@ -795,6 +821,13 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
                     }
                     return;
                 }
+
+                /**
+                 *
+                 * 如果processQueue中的maxSpan大于消费者的ConsumeMaxSpan，
+                 * 也就是第一个消息与最后一个消息的点位偏差大于ConsumeMaxSpan（默认是2000），
+                 * 将触发限流机制，当前任务不执行，50毫秒后重新执行该任务；
+                 */
 
                 if (processQueue.getMaxSpan() > defaultLitePullConsumer.getConsumeMaxSpan()) {
                     scheduledThreadPoolExecutor.schedule(this, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL, TimeUnit.MILLISECONDS);
@@ -924,6 +957,7 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
             null
         );
         this.pullAPIWrapper.processPullResult(mq, pullResult, subscriptionData);
+        // 下面是调用consumeMessageHook
         if (!this.consumeMessageHookList.isEmpty()) {
             ConsumeMessageContext consumeMessageContext = new ConsumeMessageContext();
             consumeMessageContext.setNamespace(defaultLitePullConsumer.getNamespace());
@@ -932,6 +966,7 @@ public class DefaultLitePullConsumerImpl implements MQConsumerInner {
             consumeMessageContext.setMsgList(pullResult.getMsgFoundList());
             consumeMessageContext.setSuccess(false);
             this.executeHookBefore(consumeMessageContext);
+            // 默认是消费成功
             consumeMessageContext.setStatus(ConsumeConcurrentlyStatus.CONSUME_SUCCESS.toString());
             consumeMessageContext.setSuccess(true);
             this.executeHookAfter(consumeMessageContext);

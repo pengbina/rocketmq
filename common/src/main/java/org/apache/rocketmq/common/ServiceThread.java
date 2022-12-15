@@ -48,6 +48,7 @@ public abstract class ServiceThread implements Runnable {
             return;
         }
         stopped = false;
+        // 把pullMessageService作为线程任务
         this.thread = new Thread(this, getServiceName());
         this.thread.setDaemon(isDaemon);
         this.thread.start();
